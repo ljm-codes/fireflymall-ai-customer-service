@@ -113,6 +113,10 @@
 
 ### ★★★ 记忆框架：BalancedMultiDimensionMemory（衡忆多维认知架构）
 
+> 🔗 该中间件已抽成独立包并开源：**https://github.com/lijia-ming/memory-middleware**
+> （`pip install memory-middleware`，零外部依赖可离线跑；内含单元测试、集成测试与三方对比基准）。
+> 本项目的接线与调优记录见 `记忆中间件修改记录_2026-10-05.md`。
+
 这是本项目的核心自研模块（`Tools/middleware/memory/`），作为一个 **LangChain Agent 中间件** 挂在主 Agent
 的模型调用前后，实现"记忆的分层存储 — 检索 — 巩固 — 遗忘"。设计参照了认知心理学中的 **艾宾浩斯遗忘曲线** 与 **自我参照效应
 **。

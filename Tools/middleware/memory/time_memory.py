@@ -266,10 +266,14 @@ class BalancedMultiDimensionMemory(AgentMiddleware):
         self._summary_llm = None
         self.memory_spliter = MemoryFragmentsAiSpliter(self.model, self.kwargs)
         self.memory_fragments_rag = FragmentsMemoryRAG()
+        # 片段 id 撞库兜底：Redis 计数器丢失（重启 / 无持久化）后从向量库持久高水位接着编
+        self.memory_spliter.id_source = self.memory_fragments_rag
         from agent.main_agent import main_system_prompt
         self._main_system_prompt = main_system_prompt
         # 按 user 隔离的提示词操作实例，避免多用户并发时互相覆盖 memory_fragments
         self._prompt_operations: dict[str, SystemPromptOperation] = dict()
+        # 调参缓存：(user_id, 主题) → 参数。主题只在切片时变，同一主题下的多次注入不必重复调 LLM
+        self._param_cache: dict = dict()
         self.math_agent_prompt = """
         你现在是一个专业的数学专家，你需要通过当前聊天主题来调整对于公式的参数。
         公式：S(m)=α*R(m,q)+β*T(m)+γ*F(m)+δ
@@ -341,11 +345,17 @@ class BalancedMultiDimensionMemory(AgentMiddleware):
 
             current_tokens = self._calculate_current_token(messages, user_id)
 
-            # text 必须传完整消息列表（消息偏移游标在 spliter 内部管理，见 atext_to_document 说明）
-            if memory_fragments := await self.memory_spliter.atext_to_document(text=state['messages'], user=user_id):
-                await self.memory_fragments_rag.add(memory_fragments)
-
             if self._is_primary_triggered(current_tokens, len(messages)):
+                # 事件 = 窗口达到预算。awrap_model_call 会把上下文截断到最近一条人类消息，
+                # 因此固化必须与事件同刻发生，否则这段内容既不在上下文、也不在暂存库。
+                # 切分不再是独立动作：一次事件 = 切分 + 调参 +（片段成熟时）归纳。
+                # text 必须传完整消息列表（消息偏移游标在 spliter 内部管理，见 atext_to_document 说明）
+                if memory_fragments := await self.memory_spliter.atext_to_document(text=state['messages'], user=user_id):
+                    try:
+                        await self.memory_fragments_rag.add(memory_fragments)
+                    except Exception as e:
+                        # 落库失败不该掀掉整轮对话：游标已推进，本批片段弃掉（留 id 空洞但不会重复）
+                        logger.error(f"记忆片段落库失败，跳过本批: {e}")
                 self._user_retrieve_state[user_id] = True
                 return None
 
@@ -592,15 +602,21 @@ class BalancedMultiDimensionMemory(AgentMiddleware):
         #       导致出现LLM选取无效片段，内容不准确。
         #   由于当前所有进行分片、总结等模型就会同一个，那么若一个失效，这将会整体失效。因此，本次提交将不改。
         all_fragments_by_theme = await self.memory_fragments_rag.query_context_distance(
-            current_theme_by_user, k=6, user_id=user_id)
+            current_theme_by_user, k=None, user_id=user_id)
         if not all_fragments_by_theme:
             # 库里还没有该用户的片段时，跳过 LLM 调参调用，避免每轮白烧一次模型
             return None
-        param_result = await self._summary_llm.ainvoke([
-            SystemMessage(content=self.math_agent_prompt),
-            HumanMessage(content=f"当前用户{user_id}的对话主题：{current_theme_by_user}"),
-        ])
-        params_class = param_result
+        cache_key = (user_id, current_theme_by_user)
+        params_class = self._param_cache.get(cache_key)
+        if params_class is None:
+            # 同一 (user, 主题) 不重复调参：主题由切分模型产出、只在切片时变，绝大多数注入都能命中缓存
+            params_class = await self._summary_llm.ainvoke([
+                SystemMessage(content=self.math_agent_prompt),
+                HumanMessage(content=f"当前用户{user_id}的对话主题：{current_theme_by_user}"),
+            ])
+            if len(self._param_cache) >= 256:   # FIFO 淘汰，防无界增长
+                self._param_cache.pop(next(iter(self._param_cache)))
+            self._param_cache[cache_key] = params_class
         w0 = params_class.w0
         w1 = params_class.w1
         w2 = params_class.w2
@@ -623,5 +639,9 @@ class BalancedMultiDimensionMemory(AgentMiddleware):
                     1 - math.exp(-strengthen_num * 0.5)), 0, 1)
             s_m = alpha * r + beta * t + gamma * f + delta
             retrieve_fragments.append((document, s_m))
-        retrieve_fragments.sort(key=lambda x: x[1], reverse=True)
-        return retrieve_fragments[:3]
+        # 保底：identity / preference 类片段优先占席（与 _TYPE_SCORE_MAP 的最高两档 0.95/0.80 一致）——
+        # 候选池里主题一偏这两类会整块落选，而它们正是公式自己声明的最重要记忆
+        _priority = {'identity', 'preference'}
+        retrieve_fragments.sort(
+            key=lambda x: (not (_priority & set(x[0].metadata.get('type') or [])), -x[1]))
+        return retrieve_fragments[:4]

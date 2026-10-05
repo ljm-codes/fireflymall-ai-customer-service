@@ -125,6 +125,10 @@ resolved":
 
 ### ★★★ The Memory Framework: BalancedMultiDimensionMemory
 
+> 🔗 Also released as a standalone package: **https://github.com/lijia-ming/memory-middleware**
+> (`pip install memory-middleware` — runs offline with zero external dependencies; ships unit tests,
+> integration tests and a three-way benchmark).
+
 This is the core self-developed module of the project (`Tools/middleware/memory/`). It plugs into the main agent as a *
 *LangChain agent middleware**, hooking into model calls to implement "layered memory storage — retrieval —
 consolidation — forgetting". Its design draws on the **Ebbinghaus forgetting curve** and the **self-reference effect**

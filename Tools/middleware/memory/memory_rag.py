@@ -195,8 +195,12 @@ async def _recover_split(data: ErrorFragmentsData) -> None:
     memory_fragments = spliter.split_text(result.theme_num, result.config, content_text, messages)
     if not memory_fragments:
         return
-    # 与 atext_to_document 相同的落库逻辑：Redis 游标续接 + 构造 Document + 写入 RAG
-    current_index = int(await spliter.redis_con.get(f"memory_fragments:{data.user_id}") or '0')
+    # 与 atext_to_document 相同的落库逻辑：Redis 游标续接（INCRBY 原子预留）+ 构造 Document + 写入 RAG
+    fragment_base = await spliter.fragment_id_base(data.user_id)
+    if fragment_base > int(await spliter.redis_con.get(f"memory_fragments:{data.user_id}") or '0'):
+        await spliter.redis_con.set(f"memory_fragments:{data.user_id}", str(fragment_base))
+    last_id = await spliter.redis_con.incrby(f"memory_fragments:{data.user_id}", len(memory_fragments))
+    current_index = last_id - len(memory_fragments)
     documents = []
     for fragment in memory_fragments:
         current_index += 1
@@ -208,7 +212,6 @@ async def _recover_split(data: ErrorFragmentsData) -> None:
             page_content=fragment.content,
             metadata=metadata,
         ))
-    await spliter.redis_con.set(f"memory_fragments:{data.user_id}", str(current_index))
     await rag.add(documents)
     logger.info(f"消费者恢复切分完成: user_id={data.user_id}, 片段数={len(documents)}")
 
@@ -317,6 +320,10 @@ class MemoryFragmentsAiSpliter:
         )
         self.redis_con = redis.Redis(connection_pool=self._redis_pool)
         self.dialogue_theme_by_user: dict[str, str] = dict()
+        # 片段 id / 消息偏移的持久化高水位来源（Redis 计数器丢失后的兜底；不注入则行为与原来一致）
+        self.id_source = None
+        self._id_reconciled: set[str] = set()
+        self._id_high_water: dict[str, int] = dict()
         self.prompt = """
         你现在是一个专业的摘要模型，你的任务是将一个长对话文本按照不同主题进行切分区域，
         并输出每个片段的主题、可能出现的类型、片段的内容等。
@@ -329,9 +336,12 @@ class MemoryFragmentsAiSpliter:
                 - fact: 包含客观事实、技术细节
                 - episode: 描述某个经历或任务过程
                 - chat: 一般性闲聊，长期价值低
+            - 类型判定只看内容本身，不看语气：用户陈述的个人信息 / 偏好 / 约束（姓名、职业、生日、机型、
+              订单号、卡尾号、作息、饮食、住址等）一律标 identity / preference / fact，
+              绝不能因为夹在闲聊里就标成 chat —— chat 只用于确实没有信息量的寒暄。
             - 片段范围：必须按照主题划分区域，且不允许跨主题。
-              scope 的 start-end 为左闭右开区间（如 0-50 表示索引 0~49 的消息），不允许出现 0-0 / 1-1 等 start=end 的情况，因为他们相减为0，
-              若要表达一个消息，必须使用 0-1 或 1-2 等范围，同样也要符合左闭右开的基本规则
+              用 start_idx 与 end_idx 两个整数表示，区间为左闭右开 [start_idx, end_idx)，即覆盖索引 start_idx ~ end_idx-1 的消息；
+              如 start_idx=0、end_idx=50 表示索引 0~49 的消息；要表达单条消息，用 start_idx=0、end_idx=1
             - 每次输出要保证 主题总数 与 记忆片段配置列表 的长度一致。
             - 一个消息会对应相对应的类型并且包含消息的索引号（从0开始），
               若消息过长，将会截取字符，一般发生在tool类型的消息中，
@@ -449,8 +459,14 @@ class MemoryFragmentsAiSpliter:
         - memory_msg_offset:{user}：已切分的消息数（切分窗口偏移，成功切片后推进到 len(text)）
         text 必须传"完整消息列表"（从会话开头），偏移由消息游标控制，保证全局单调。
         """
-        fragment_base = int(await self.redis_con.get(f"memory_fragments:{user}") or '0')
-        msg_offset = int(await self.redis_con.get(f"memory_msg_offset:{user}") or '0')
+        fragment_base = await self.fragment_id_base(user)
+        raw_offset = await self.redis_con.get(f"memory_msg_offset:{user}")
+        msg_offset = int(raw_offset or '0')
+        if raw_offset is None:
+            # Redis 丢了：从片段元数据的持久高水位恢复切分进度，避免同一会话被从 0 重切出重复片段
+            probed = await self._probed_ids(user)
+            if probed is not None:
+                msg_offset = max(msg_offset, probed[1])
         # 新会话检测：消息列表比游标短 → 游标属于上一个会话的消息流，重置为 0。
         # （偏移语义是"本消息流已切分的消息数"；同一会话内 state['messages'] 只增不减）
         if len(text or []) < msg_offset:
@@ -460,8 +476,13 @@ class MemoryFragmentsAiSpliter:
         # 由 asplit_text 产出，一般是因为出现网络异常或者是API欠费等。
         if not memory_fragments:
             return None
+        # 原子预留：先把计数器抬到持久高水位（Redis 丢失或落后时），再一次性 INCRBY 拿 n 个 id。
+        # 多进程下每个进程各自可能做一次校正，但 INCRBY 保证各进程拿到的 id 段互不重叠。
+        if fragment_base > int(await self.redis_con.get(f"memory_fragments:{user}") or '0'):
+            await self.redis_con.set(f"memory_fragments:{user}", str(fragment_base))
+        last_id = await self.redis_con.incrby(f"memory_fragments:{user}", len(memory_fragments))
         documents = []
-        fragment_id = fragment_base
+        fragment_id = last_id - len(memory_fragments)
         for fragment in memory_fragments:
             fragment_id += 1
             metadata = fragment.config.model_dump()
@@ -475,10 +496,40 @@ class MemoryFragmentsAiSpliter:
                 metadata=metadata,
             )
             documents.append(document)
-        await self.redis_con.set(f"memory_fragments:{user}", str(fragment_id))
+        if documents:
+            # 最后一片记下"切到哪了"：Redis 丢失后据此恢复消息偏移（旧数据无此键 → 取 0，行为不变）
+            documents[-1].metadata['msg_end'] = len(text or [])
+        # 计数器已由 incrby 原子写回（值 = last_id），这里只更新进程内高水位
+        self._id_high_water[user] = last_id
         # 消息偏移 = 完整消息列表长度（切分失败时不推进，下轮重试）
         await self.redis_con.set(f"memory_msg_offset:{user}", str(len(text or [])))
         return documents
+
+    async def _probed_ids(self, user: str):
+        """向持久化来源探一次 (最大片段 id, 最大已切分消息数)；未注入来源或查询失败返回 None"""
+        if self.id_source is None:
+            return None
+        try:
+            return self.id_source.max_fragment_ids(user)
+        except Exception as e:
+            logger.warning(f"片段高水位兜底查询失败，沿用 Redis 计数器: {e}")
+            return None
+
+    async def fragment_id_base(self, user: str) -> int:
+        """片段 id 基数：Redis 快路径 + 持久高水位兜底，只抬高不回退。
+
+        触发兜底查询的条件（其余情况零额外查询）：
+        - Redis 键缺失或为 0（计数器丢失的失败信号）
+        - 本进程尚未校正过该用户（覆盖"Redis 存在但落后"，如恢复了旧 RDB 快照）
+        """
+        raw = await self.redis_con.get(f"memory_fragments:{user}")
+        base = int(raw or '0')
+        if raw is None or base == 0 or user not in self._id_reconciled:
+            probed = await self._probed_ids(user)
+            if probed is not None:
+                base = max(base, probed[0])
+                self._id_reconciled.add(user)
+        return max(base, self._id_high_water.get(user, 0))
 
     @staticmethod
     def split_text(theme_num, conf, text: list[str], messages: list[BaseMessage]) -> List[MemoryFragments]:
@@ -492,18 +543,13 @@ class MemoryFragmentsAiSpliter:
         memory_fragments = []
         valid_count = min(theme_num, len(conf))
         for i in range(valid_count):
-            try:
-                start, end = conf[i].scope.split('-')
-                start = int(start)
-                end = int(end)
-            except (ValueError, AttributeError):
-                logger.warning(f"第 {i} 个片段 scope 解析失败: {conf[i].scope!r}，跳过该片段")
-                continue
-            # 防御 LLM 越界：scope 为左闭右开区间，end 最多取到消息末尾
-            start = max(start, 0)
-            end = min(end, len(messages))
-            if start >= end:
-                logger.warning(f"第 {i} 个片段范围无效: {conf[i].scope!r}，跳过该片段")
+            # 负索引、零宽/反向区间已在 SummaryMemoryFragmentsConfig 的模型校验里兜底，
+            # 这里只处理与消息条数相关的越界
+            start = conf[i].start_idx
+            end = min(conf[i].end_idx, len(messages))
+            if start >= len(messages) or start >= end:
+                logger.warning(f"第 {i} 个片段范围无效: [{start}, {end})，"
+                               f"消息数 {len(messages)}，跳过该片段")
                 continue
 
             content = "\n".join(text[start:end])
@@ -556,6 +602,25 @@ class FragmentsMemoryRAG:
         self._con.execute("PRAGMA journal_mode=WAL")
         self._con.execute("PRAGMA busy_timeout=5000")
 
+    def max_fragment_ids(self, user_id: str) -> tuple:
+        """该用户片段的高水位：(最大片段 id, 最大已切分消息数)。
+
+        片段 id 计数器活在 Redis、片段本体在这里；Redis 一丢（重启 / 无持久化）
+        计数器就从 1 重算并撞 UNIQUE 约束，故用库里的持久高水位兜底。
+        msg_end 由写入端打在每次切分的最后一片 metadata 上；旧数据没这个键 → 取 0，
+        行为与兜底前一致，无需迁移。
+        """
+        cursor = self._con.cursor()
+        cursor.execute(
+            "select max(cast(json_extract(metadata, '$.id') as integer)) as max_fid, "
+            "max(cast(json_extract(metadata, '$.msg_end') as integer)) as max_offset "
+            "from memory_fragments where json_extract(metadata, '$.user_id') = ?",
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        cursor.close()
+        return (int(row['max_fid'] or 0), int(row['max_offset'] or 0))
+
     async def add(self, memory: Optional[List[Document]]) -> None:
         if not memory:
             logger.error("记忆片段不能为空")
@@ -566,10 +631,16 @@ class FragmentsMemoryRAG:
     async def query_context_distance(
             self,
             query: str,
-            k: int = 5,
+            k: Optional[int] = None,
             user_id: Optional[str] = None,
     ) -> List[Tuple[Document, float]]:
-        """检索与 query 最相似的记忆片段，按 user_id 过滤，避免跨用户泄露"""
+        """检索与 query 最相似的记忆片段，按 user_id 过滤，避免跨用户泄露。
+
+        k=None 表示不预筛（该用户全部片段都作为候选）：预筛按主题相似度取候选，主题一偏就会
+        把载着细节的片段整块挡在门外。sqlite-vec 本就是全表算距离再取前 k，放开几乎零成本。
+        """
+        if k is None:
+            k = 4096
         async with self._sql_lock:
             doc_scores = await self.sql_vec.asimilarity_search_with_score(
                 query=query, k=k, filter={'user_id': user_id})
