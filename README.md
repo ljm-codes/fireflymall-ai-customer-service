@@ -113,7 +113,7 @@
 
 ### ★★★ 记忆框架：BalancedMultiDimensionMemory（衡忆多维认知架构）
 
-> 🔗 该中间件已抽成独立包并开源：**https://github.com/lijia-ming/memory-middleware**
+> 🔗 该中间件已抽成独立包并开源：**https://github.com/ljm-codes/memory-middleware**
 > （`pip install memory-middleware`，零外部依赖可离线跑；内含单元测试、集成测试与三方对比基准）。
 > 本项目的接线与调优记录见 `记忆中间件修改记录_2026-10-05.md`。
 
