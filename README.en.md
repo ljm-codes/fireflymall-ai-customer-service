@@ -125,7 +125,7 @@ resolved":
 
 ### ★★★ The Memory Framework: BalancedMultiDimensionMemory
 
-> 🔗 Also released as a standalone package: **https://github.com/lijia-ming/memory-middleware**
+> 🔗 Also released as a standalone package: **https://github.com/ljm-codes/memory-middleware**
 > (`pip install memory-middleware` — runs offline with zero external dependencies; ships unit tests,
 > integration tests and a three-way benchmark).
 
